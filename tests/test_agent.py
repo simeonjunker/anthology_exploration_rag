@@ -203,3 +203,92 @@ def test_earlier_turn_constraints_are_kept_in_follow_ups(store):
     result = ask(graph, "only at EMNLP")
     assert result["filters"].year_from == 2022
     assert result["filters"].venues == ["emnlp"]
+
+
+def list_all_papers(graph):
+    return ask(graph, "all 4 translation papers", thread="s")
+
+
+def test_similar_to_uses_listed_paper_text_and_excludes_it(store):
+    llm = FakeLLM(
+        [
+            Filters(topic="translation", num_results=4),
+            Filters(topic="x", similar_to=2, num_results=3),
+        ]
+    )
+    graph = build_graph(llm, store)
+    first = list_all_papers(graph)
+    anchor = first["docs"][1]
+    second = ask(graph, "similar papers like 2", thread="s")
+    expected = store.similarity_search_with_score(anchor.page_content, k=4)
+    expected = [d.id for d, _ in expected if d.id != anchor.id]
+    assert [d.id for d in second["docs"]] == expected
+    assert anchor.id not in expected
+    assert second["messages"][-1].content.startswith("1. ")
+    assert second["scores"] == sorted(second["scores"], reverse=True)
+
+
+def test_similar_to_unknown_number_gives_message(store):
+    llm = FakeLLM([Filters(topic="translation", num_results=2), Filters(topic="x", similar_to=9)])
+    graph = build_graph(llm, store)
+    ask(graph, "2 translation papers", thread="s")
+    result = ask(graph, "similar to 9", thread="s")
+    assert result["messages"][-1].content == "There is no paper 9 in the last list."
+
+
+def test_more_after_similar_continues_similar_search(store):
+    llm = FakeLLM(
+        [
+            Filters(topic="translation", num_results=4),
+            Filters(topic="x", similar_to=1, num_results=1),
+            Filters(topic="x", more=True, num_results=1),
+        ]
+    )
+    graph = build_graph(llm, store)
+    first = list_all_papers(graph)
+    second = ask(graph, "similar to 1", thread="s")
+    third = ask(graph, "more", thread="s")
+    ids = [d.id for d in second["docs"] + third["docs"]]
+    assert len(set(ids)) == 2 and first["docs"][0].id not in ids
+    assert third["messages"][-1].content.startswith("2. ")
+
+
+def test_more_reuses_previous_search_and_ignores_llm_filters(store):
+    llm = FakeLLM(
+        [
+            Filters(topic="translation", num_results=4),
+            Filters(topic="x", similar_to=1, num_results=1),
+            # What a model might emit for "more": drifted topic, filters and a stale similar_to.
+            Filters(topic="speech", year_from=2023, venues=["acl"], more=True, similar_to=1),
+        ]
+    )
+    graph = build_graph(llm, store)
+    list_all_papers(graph)
+    second = ask(graph, "similar to 1", thread="s")
+    third = ask(graph, "more", thread="s")
+    assert third["filters"].topic == "x"
+    assert third["filters"].year_from is None and third["filters"].venues == []
+    assert third["filters"].similar_to is None
+    assert third["messages"][-1].content.startswith("2. ")
+    assert not {d.id for d in second["docs"]} & {d.id for d in third["docs"]}
+
+
+def test_new_constraint_on_follow_up_restarts_similar_search(store):
+    llm = FakeLLM(
+        [
+            Filters(topic="translation", num_results=4),
+            Filters(topic="x", similar_to=1, num_results=2),
+            # The model flags a pure filter follow-up as "more" and drifts the topic.
+            Filters(topic="speech", year_from=2022, more=True),
+        ]
+    )
+    graph = build_graph(llm, store)
+    first = list_all_papers(graph)
+    ask(graph, "similar to 1", thread="s")
+    third = ask(graph, "from 2022 or later", thread="s")
+    assert third["filters"].year_from == 2022
+    assert third["filters"].topic == "x"  # still the similar-paper search
+    assert third["messages"][-1].content.startswith("1. ")  # restarted, not continued
+    assert all(d.metadata["year"] >= 2022 for d in third["docs"])
+    assert first["docs"][0].id not in {d.id for d in third["docs"]}
+    assert third["docs"]

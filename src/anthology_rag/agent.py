@@ -28,7 +28,9 @@ PARSE_PROMPT = (
     "conversation; never guess or infer them. Leave them empty otherwise. "
     "Set num_results only if the user asks for a specific number of papers. "
     "Set more=true when the user asks for more or further results of the same search "
-    "(e.g. 'more', 'show me 5 more'); keep the previous topic and constraints then."
+    "(e.g. 'more', 'show me 5 more'); keep the previous topic and constraints then. "
+    "Set similar_to to the list number when the user asks for papers similar to a listed "
+    "paper (e.g. 'similar papers like 15'); the topic can then be that paper's title."
 )
 
 
@@ -42,6 +44,9 @@ class Filters(BaseModel):
     venues: list[str] = Field(default_factory=list)
     num_results: int | None = Field(default=None, ge=1, description="Requested number of papers")
     more: bool = Field(default=False, description="User wants further results of the last search")
+    similar_to: int | None = Field(
+        default=None, ge=1, description="Number of a listed paper the user wants similar ones to"
+    )
 
 
 class State(TypedDict, total=False):
@@ -51,8 +56,15 @@ class State(TypedDict, total=False):
     filters: Filters
     docs: list[Document]
     scores: list[float]
-    # Papers of the current search shown so far; "more" continues after them.
+    # Papers of the current search shown so far; "more" continues after them, and
+    # "similar to N" looks up paper N in `listed` (numbers match what the user sees).
     shown: int
+    listed: list[Document]
+    # Paper a similar-paper search is based on, kept so "more" continues that search.
+    anchor: Document | None
+    error: str
+    # True when a "more" request changed the constraints, so results start again at 1.
+    restart: bool
 
 
 def _history(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -82,6 +94,9 @@ def _only_requested(filters: Filters, messages: list[BaseMessage]) -> Filters:
             else None,
             "year_to": filters.year_to
             if filters.year_to and str(filters.year_to) in words
+            else None,
+            "similar_to": filters.similar_to
+            if filters.similar_to and str(filters.similar_to) in words
             else None,
         }
     )
@@ -123,37 +138,78 @@ def build_graph(llm: BaseChatModel, store: Chroma) -> CompiledStateGraph:
     def parse_query(state: State) -> State:
         history = _history(state["messages"])
         filters = parser.invoke([SystemMessage(PARSE_PROMPT), *history])
-        return {"filters": _only_requested(filters, history)}
+        if filters.more and "filters" in state:
+            # "More" keeps the previous topic and similar-paper anchor; re-deriving them from
+            # the history made the LLM drift. Only constraints the user states anew (e.g.
+            # "from 2025 or later") are taken from the LLM; if they change the search, it
+            # restarts from the top instead of continuing the old result list.
+            previous = state["filters"]
+            requested = _only_requested(filters, history)
+            constraints = {
+                "authors": requested.authors or previous.authors,
+                "venues": requested.venues or previous.venues,
+                "year_from": requested.year_from or previous.year_from,
+                "year_to": requested.year_to or previous.year_to,
+            }
+            restart = any(getattr(previous, key) != value for key, value in constraints.items())
+            update = {"more": True, "num_results": filters.num_results, "similar_to": None}
+            return {
+                "filters": previous.model_copy(update=update | constraints),
+                "restart": restart,
+            }
+        return {"filters": _only_requested(filters, history), "restart": False}
 
     # Node 2 (no LLM): vector search on the topic, metadata filters applied in Chroma.
     # Explicit count or "more": a page of that size after the papers already shown.
     # Otherwise: everything above MIN_SIMILARITY, within MIN_RESULTS..MAX_RESULTS.
     def retrieve(state: State) -> State:
         filters = state["filters"]
-        offset = state.get("shown", 0) if filters.more else 0
+        listed = state.get("listed", [])
+        continuing = filters.more and not state["restart"]
+        anchor = state.get("anchor") if filters.more else None
+        if filters.similar_to is not None:
+            if not 1 <= filters.similar_to <= len(listed):
+                return {
+                    "docs": [],
+                    "scores": [],
+                    "shown": 0,
+                    "error": f"There is no paper {filters.similar_to} in the last list.",
+                }
+            anchor = listed[filters.similar_to - 1]
+        offset = state.get("shown", 0) if continuing else 0
         page = filters.num_results or MAX_RESULTS
-        k = offset + page
+        k = offset + page + (anchor is not None)  # the anchor paper itself is dropped below
         if filters.authors:
             k = max(k, NUM_CANDIDATES_WITH_AUTHORS)
-        hits = store.similarity_search_with_score(filters.topic, k=k, filter=_where(filters))
+        # Similar-paper search embeds the anchor's title and abstract (its page_content).
+        query = anchor.page_content if anchor else filters.topic
+        hits = store.similarity_search_with_score(query, k=k, filter=_where(filters))
+        if anchor:
+            hits = [(d, s) for d, s in hits if d.id != anchor.id]
         for author in filters.authors:
             hits = [(d, s) for d, s in hits if author.lower() in d.metadata["authors"].lower()]
         # The collection uses cosine distance, so similarity = 1 - distance (1.0 = identical).
         hits = [(d, 1 - s) for d, s in hits]
-        if filters.more or filters.num_results:
+        if continuing or filters.num_results:
             hits = hits[offset : offset + page]
         else:
             relevant = sum(score >= MIN_SIMILARITY for _, score in hits)
             hits = hits[: min(MAX_RESULTS, max(relevant, MIN_RESULTS))]
+        docs = [d for d, _ in hits]
         return {
-            "docs": [d for d, _ in hits],
+            "docs": docs,
             "scores": [score for _, score in hits],
             "shown": offset + len(hits),
+            "listed": listed + docs if continuing else docs,
+            "anchor": anchor,
+            "error": "",
         }
 
     # Node 3 (no LLM): a fixed format keeps every answer identical in structure and means the
     # scores are exactly the ones Chroma computed. The list is added to the chat history.
     def respond(state: State) -> State:
+        if state["error"]:
+            return {"messages": [AIMessage(state["error"])]}
         if not state["docs"]:
             text = "No more papers found." if state["shown"] else "No papers matched your request."
             return {"messages": [AIMessage(text)]}
