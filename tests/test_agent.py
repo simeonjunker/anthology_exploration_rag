@@ -292,3 +292,28 @@ def test_new_constraint_on_follow_up_restarts_similar_search(store):
     assert all(d.metadata["year"] >= 2022 for d in third["docs"])
     assert first["docs"][0].id not in {d.id for d in third["docs"]}
     assert third["docs"]
+
+
+def test_non_search_message_gets_reply_and_keeps_previous_search(store):
+    llm = FakeLLM(
+        [
+            Filters(topic="translation", num_results=2),
+            Filters(reply="You're welcome!"),
+            Filters(more=True),
+        ]
+    )
+    graph = build_graph(llm, store)
+    ask(graph, "2 papers about translation", thread="s")
+    thanks = ask(graph, "thanks", thread="s")
+    assert thanks["is_chat"]
+    assert thanks["messages"][-1].content == "You're welcome!"
+    assert len(thanks["docs"]) == 2  # previous results untouched
+    more = ask(graph, "more", thread="s")
+    assert more["messages"][-1].content.startswith("3. ")
+
+
+def test_non_search_message_as_first_turn(store):
+    graph = build_graph(FakeLLM([Filters(reply="Hello!")]), store)
+    result = ask(graph, "hi")
+    assert result["messages"][-1].content == "Hello!"
+    assert "docs" not in result
