@@ -13,8 +13,10 @@ from pydantic import BaseModel, Field
 
 from anthology_rag.config import (
     MAX_HISTORY_MESSAGES,
+    MAX_RESULTS,
+    MIN_RESULTS,
+    MIN_SIMILARITY,
     NUM_CANDIDATES_WITH_AUTHORS,
-    NUM_RESULTS,
 )
 
 PARSE_PROMPT = (
@@ -23,12 +25,10 @@ PARSE_PROMPT = (
     "authors'. Keep the previous constraints unless the user changes or drops them. "
     "Venues are lowercase anthology venue IDs, e.g. acl, emnlp, naacl, coling, lrec. "
     "Only set authors, years or venues that the user explicitly asked for in the "
-    "conversation; never guess or infer them. Leave them empty otherwise."
-)
-RESPOND_PROMPT = (
-    "You help users find papers in the ACL Anthology. Answer using ONLY the papers below. "
-    "List the relevant ones as a numbered list with title, authors, venue, year and URL. "
-    "Do not invent papers.\n\nRetrieved papers:\n{papers}"
+    "conversation; never guess or infer them. Leave them empty otherwise. "
+    "Set num_results only if the user asks for a specific number of papers. "
+    "Set more=true when the user asks for more or further results of the same search "
+    "(e.g. 'more', 'show me 5 more'); keep the previous topic and constraints then."
 )
 
 
@@ -40,14 +40,19 @@ class Filters(BaseModel):
     year_from: int | None = None
     year_to: int | None = None
     venues: list[str] = Field(default_factory=list)
+    num_results: int | None = Field(default=None, ge=1, description="Requested number of papers")
+    more: bool = Field(default=False, description="User wants further results of the last search")
 
 
 class State(TypedDict, total=False):
     # add_messages appends new messages, so the checkpointer accumulates the chat history.
     messages: Annotated[list[BaseMessage], add_messages]
-    # filters and docs are recomputed on every turn.
+    # filters, docs and scores are recomputed on every turn; scores[i] belongs to docs[i].
     filters: Filters
     docs: list[Document]
+    scores: list[float]
+    # Papers of the current search shown so far; "more" continues after them.
+    shown: int
 
 
 def _history(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -101,11 +106,13 @@ def _where(filters: Filters) -> dict | None:
     return clauses[0] if len(clauses) == 1 else {"$and": clauses}
 
 
-def _format_paper(doc: Document) -> str:
+def _format_paper(rank: int, doc: Document, score: float) -> str:
     m = doc.metadata
     return (
-        f"- {m['title']} | authors: {m['authors']} | venue: {m['venues']} | "
-        f"year: {m['year']} | url: {m['url']}\n  abstract: {m['abstract'][:500]}"
+        f"{rank}. {m['title']}\n"
+        f"   Authors: {m['authors']}\n"
+        f"   Year: {m['year']} | Venue: {m['venues']} | Score: {score:.2f}\n"
+        f"   Link: {m['url']}"
     )
 
 
@@ -119,23 +126,43 @@ def build_graph(llm: BaseChatModel, store: Chroma) -> CompiledStateGraph:
         return {"filters": _only_requested(filters, history)}
 
     # Node 2 (no LLM): vector search on the topic, metadata filters applied in Chroma.
+    # Explicit count or "more": a page of that size after the papers already shown.
+    # Otherwise: everything above MIN_SIMILARITY, within MIN_RESULTS..MAX_RESULTS.
     def retrieve(state: State) -> State:
         filters = state["filters"]
-        k = NUM_CANDIDATES_WITH_AUTHORS if filters.authors else NUM_RESULTS
-        docs = store.similarity_search(filters.topic, k=k, filter=_where(filters))
+        offset = state.get("shown", 0) if filters.more else 0
+        page = filters.num_results or MAX_RESULTS
+        k = offset + page
+        if filters.authors:
+            k = max(k, NUM_CANDIDATES_WITH_AUTHORS)
+        hits = store.similarity_search_with_score(filters.topic, k=k, filter=_where(filters))
         for author in filters.authors:
-            docs = [d for d in docs if author.lower() in d.metadata["authors"].lower()]
-        return {"docs": docs[:NUM_RESULTS]}
+            hits = [(d, s) for d, s in hits if author.lower() in d.metadata["authors"].lower()]
+        # The collection uses cosine distance, so similarity = 1 - distance (1.0 = identical).
+        hits = [(d, 1 - s) for d, s in hits]
+        if filters.more or filters.num_results:
+            hits = hits[offset : offset + page]
+        else:
+            relevant = sum(score >= MIN_SIMILARITY for _, score in hits)
+            hits = hits[: min(MAX_RESULTS, max(relevant, MIN_RESULTS))]
+        return {
+            "docs": [d for d, _ in hits],
+            "scores": [score for _, score in hits],
+            "shown": offset + len(hits),
+        }
 
-    # Node 3 (LLM): write the answer from the retrieved papers; the reply is added to the
-    # history, but the papers themselves are not, so old results don't fill the context.
+    # Node 3 (no LLM): a fixed format keeps every answer identical in structure and means the
+    # scores are exactly the ones Chroma computed. The list is added to the chat history.
     def respond(state: State) -> State:
-        docs = state["docs"]
-        if not docs:
-            return {"messages": [AIMessage("No papers matched your request.")]}
-        papers = "\n".join(_format_paper(d) for d in docs)
-        prompt = SystemMessage(RESPOND_PROMPT.format(papers=papers))
-        return {"messages": [llm.invoke([prompt, *_history(state["messages"])])]}
+        if not state["docs"]:
+            text = "No more papers found." if state["shown"] else "No papers matched your request."
+            return {"messages": [AIMessage(text)]}
+        first_rank = state["shown"] - len(state["docs"]) + 1
+        papers = [
+            _format_paper(i, d, s)
+            for i, (d, s) in enumerate(zip(state["docs"], state["scores"]), start=first_rank)
+        ]
+        return {"messages": [AIMessage("\n\n".join(papers))]}
 
     graph = StateGraph(State)
     graph.add_node("parse_query", parse_query)

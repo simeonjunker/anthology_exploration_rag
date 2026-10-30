@@ -23,7 +23,11 @@ MAX_PAPERS = int(n) if (n := os.getenv("MAX_PAPERS")) else None
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "256"))
 
 # Retrieval
-NUM_RESULTS = int(os.getenv("NUM_RESULTS", "10"))
+# Without an explicit count: return papers with cosine similarity >= MIN_SIMILARITY, but at
+# least MIN_RESULTS and at most MAX_RESULTS. MAX_RESULTS is also the page size for "more".
+MIN_SIMILARITY = float(os.getenv("MIN_SIMILARITY", "0.5"))
+MIN_RESULTS = int(os.getenv("MIN_RESULTS", "3"))
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
 # Authors are matched after the vector search, so fetch more candidates.
 NUM_CANDIDATES_WITH_AUTHORS = int(os.getenv("NUM_CANDIDATES_WITH_AUTHORS", "300"))
 # Only the last N messages are sent to the LLM, to keep the context small.

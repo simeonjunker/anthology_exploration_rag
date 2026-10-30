@@ -1,5 +1,4 @@
 import pytest
-from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
 from anthology_rag.agent import MAX_HISTORY_MESSAGES, Filters, build_graph
@@ -8,12 +7,11 @@ from tests.fakes import PAPERS, FakeAnthology, FakeEmbeddings
 
 
 class FakeLLM:
-    """Returns queued Filters from the parser and echoes the paper list as the answer."""
+    """Returns queued Filters from the parser; the answer is formatted without the LLM."""
 
     def __init__(self, filters: list[Filters]):
         self.filters = list(filters)
         self.parse_inputs: list[list] = []
-        self.respond_inputs: list[list] = []
 
     def with_structured_output(self, schema):
         def parse(messages):
@@ -21,10 +19,6 @@ class FakeLLM:
             return self.filters.pop(0)
 
         return RunnableLambda(parse)
-
-    def invoke(self, messages):
-        self.respond_inputs.append(messages)
-        return AIMessage(messages[0].content)
 
 
 @pytest.fixture
@@ -80,19 +74,32 @@ def test_filters_return_exactly_matching_papers(store, filters, expected_ids):
     assert {d.id for d in result["docs"]} == expected_ids
 
 
-def test_answer_is_grounded_in_retrieved_papers(store):
+def test_answer_lists_title_authors_year_venue_and_score(store):
     llm = FakeLLM([Filters(topic="translation", venues=["emnlp"])])
     result = ask(build_graph(llm, store), "translation at emnlp")
-    system_prompt = result["messages"][-1].content
-    assert "Neural machine translation again" in system_prompt
-    assert "Speech recognition" not in system_prompt
+    answer = result["messages"][-1].content
+    doc = result["docs"][0]
+    assert doc.metadata["title"] == "Neural machine translation again"
+    assert answer.startswith(f"1. {doc.metadata['title']}")
+    assert f"Authors: {doc.metadata['authors']}" in answer
+    assert f"Year: {doc.metadata['year']} | Venue: {doc.metadata['venues']}" in answer
+    assert f"Score: {result['scores'][0]:.2f}" in answer
+    assert f"Link: {doc.metadata['url']}" in answer
+    assert "Speech recognition" not in answer
 
 
-def test_no_match_answers_without_calling_llm(store):
+def test_scores_are_similarities_ordered_best_first(store):
+    result = ask(build_graph(FakeLLM([Filters(topic="speech recognition")]), store), "speech")
+    scores = result["scores"]
+    assert len(scores) == len(result["docs"])
+    assert scores == sorted(scores, reverse=True)
+    assert scores[0] > scores[-1]
+
+
+def test_no_match_answers_without_papers(store):
     llm = FakeLLM([Filters(topic="translation", year_from=2030)])
     result = ask(build_graph(llm, store), "translation since 2030")
     assert result["docs"] == []
-    assert llm.respond_inputs == []
     assert "No papers" in result["messages"][-1].content
 
 
@@ -124,11 +131,64 @@ def test_history_is_trimmed(store):
 
 def test_filters_not_mentioned_by_user_are_dropped(store):
     invented = Filters(
-        topic="translation", authors=["Ann Lee"], year_from=2023, year_to=2024, venues=["acl"]
+        topic="translation",
+        authors=["Ann Lee"],
+        year_from=2023,
+        year_to=2024,
+        venues=["acl"],
+        num_results=10,
     )
     result = ask(build_graph(FakeLLM([invented]), store), "papers about translation")
-    assert result["filters"] == Filters(topic="translation")
+    assert result["filters"] == Filters(topic="translation", num_results=10)
     assert len(result["docs"]) == 4  # nothing filtered out
+
+
+def test_explicit_count_limits_results(store):
+    graph = build_graph(FakeLLM([Filters(topic="translation", num_results=2)]), store)
+    result = ask(graph, "2 papers about translation")
+    assert len(result["docs"]) == 2
+    assert result["scores"] == sorted(result["scores"], reverse=True)
+
+
+def test_default_count_stays_within_min_and_max(store, monkeypatch):
+    import anthology_rag.agent as agent
+
+    monkeypatch.setattr(agent, "MIN_SIMILARITY", 2.0)  # nothing is similar enough
+    monkeypatch.setattr(agent, "MIN_RESULTS", 2)
+    result = ask(build_graph(FakeLLM([Filters(topic="translation")]), store), "translation")
+    assert len(result["docs"]) == 2
+
+    monkeypatch.setattr(agent, "MIN_SIMILARITY", -1.0)  # everything is similar enough
+    monkeypatch.setattr(agent, "MAX_RESULTS", 3)
+    result = ask(build_graph(FakeLLM([Filters(topic="translation")]), store), "translation")
+    assert len(result["docs"]) == 3
+
+
+def test_default_returns_all_papers_above_threshold(store, monkeypatch):
+    import anthology_rag.agent as agent
+
+    monkeypatch.setattr(agent, "MIN_RESULTS", 1)
+    monkeypatch.setattr(agent, "MIN_SIMILARITY", 0.5)
+    result = ask(build_graph(FakeLLM([Filters(topic="speech recognition")]), store), "speech")
+    assert len(result["docs"]) == sum(s >= 0.5 for s in result["scores"]) >= 1
+
+
+def test_more_continues_after_shown_papers(store):
+    llm = FakeLLM(
+        [
+            Filters(topic="translation", num_results=2),
+            Filters(topic="translation", more=True),
+            Filters(topic="translation", more=True),
+        ]
+    )
+    graph = build_graph(llm, store)
+    first = ask(graph, "2 papers about translation")
+    second = ask(graph, "more")
+    assert {d.id for d in first["docs"]}.isdisjoint(d.id for d in second["docs"])
+    assert len(second["docs"]) == 2
+    assert second["messages"][-1].content.startswith("3. ")
+    third = ask(graph, "more")
+    assert third["messages"][-1].content == "No more papers found."
 
 
 def test_earlier_turn_constraints_are_kept_in_follow_ups(store):

@@ -33,4 +33,6 @@ def main() -> None:
                 {"messages": [("user", question)]},
                 {"configurable": {"thread_id": thread_id}},
             )
+            search = result["filters"].model_dump(exclude_defaults=True)
+            print(f"[search] {search}\n")
             print(result["messages"][-1].content)
