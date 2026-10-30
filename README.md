@@ -20,6 +20,34 @@ adds new papers, deletes removed ones and re-embeds only those whose title/abstr
 
 Chat commands: `/reset` starts a new conversation, `/quit` exits.
 
+## What you can ask
+
+Each answer starts with a `[search]` line showing the query the model derived, followed by a
+numbered list. Every hit shows title, authors, year, venue, a similarity score (cosine, 1.0 =
+identical) and the anthology link. The list is built by the code, not the LLM, so scores and
+links are exact.
+
+| Interaction | Example |
+| --- | --- |
+| Topic search | `Papers about <topic>` |
+| Filter by year, venue, author | `... from <year> or later`, `... at <venue>`, `... by <author>` |
+| Number of results | `<N> papers about <topic>` |
+| More results | `more`, `<N> more` (continues the numbering) |
+| Refine the last search | `from <year> or later`, `only at <venue>` (restarts the list at 1) |
+| Similar papers | `similar papers like <N>` (embeds that paper's title and abstract) |
+| Small talk | `thanks`, `hello` get a short reply; the last search stays available |
+
+Notes:
+
+- Without a number you get all papers above `MIN_SIMILARITY`, but at least `MIN_RESULTS` and at
+  most `MAX_RESULTS` (see [.env.example](.env.example)). `MAX_RESULTS` is also the page size for
+  "more".
+- Paper numbers refer to the most recent list, including papers added by "more".
+- Years, venues, authors and paper numbers are only used if you actually wrote them; the model
+  cannot add them on its own.
+- Venues are anthology venue IDs such as `acl`, `emnlp`, `naacl`, `coling`, `lrec`.
+- Only the last `MAX_HISTORY_MESSAGES` messages are sent to the model.
+
 ## Docker
 
 Build the image:
