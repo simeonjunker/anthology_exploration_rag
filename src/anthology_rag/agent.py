@@ -26,6 +26,9 @@ PARSE_PROMPT = (
     "Venues are lowercase anthology venue IDs, e.g. acl, emnlp, naacl, coling, lrec. "
     "Only set authors, years or venues that the user explicitly asked for in the "
     "conversation; never guess or infer them. Leave them empty otherwise. "
+    "If the latest message is not a request for papers (thanks, greetings, small talk, "
+    "questions about you), set reply to a short, friendly answer and leave the search "
+    "fields empty; otherwise leave reply empty. "
     "Set num_results only if the user asks for a specific number of papers. "
     "Set more=true when the user asks for more or further results of the same search "
     "(e.g. 'more', 'show me 5 more'); keep the previous topic and constraints then. "
@@ -37,7 +40,8 @@ PARSE_PROMPT = (
 class Filters(BaseModel):
     """Structured search request the LLM extracts from the conversation."""
 
-    topic: str = Field(description="Standalone topic to search for")
+    topic: str = Field(default="", description="Standalone topic to search for")
+    reply: str = Field(default="", description="Answer to a message that is not a paper search")
     authors: list[str] = Field(default_factory=list, description="Author names")
     year_from: int | None = None
     year_to: int | None = None
@@ -65,6 +69,8 @@ class State(TypedDict, total=False):
     error: str
     # True when a "more" request changed the constraints, so results start again at 1.
     restart: bool
+    # True when the last message was not a search; the previous search stays untouched.
+    is_chat: bool
 
 
 def _history(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -138,6 +144,8 @@ def build_graph(llm: BaseChatModel, store: Chroma) -> CompiledStateGraph:
     def parse_query(state: State) -> State:
         history = _history(state["messages"])
         filters = parser.invoke([SystemMessage(PARSE_PROMPT), *history])
+        if filters.reply:
+            return {"messages": [AIMessage(filters.reply)], "is_chat": True}
         if filters.more and "filters" in state:
             # "More" keeps the previous topic and similar-paper anchor; re-deriving them from
             # the history made the LLM drift. Only constraints the user states anew (e.g.
@@ -156,8 +164,9 @@ def build_graph(llm: BaseChatModel, store: Chroma) -> CompiledStateGraph:
             return {
                 "filters": previous.model_copy(update=update | constraints),
                 "restart": restart,
+                "is_chat": False,
             }
-        return {"filters": _only_requested(filters, history), "restart": False}
+        return {"filters": _only_requested(filters, history), "restart": False, "is_chat": False}
 
     # Node 2 (no LLM): vector search on the topic, metadata filters applied in Chroma.
     # Explicit count or "more": a page of that size after the papers already shown.
@@ -225,7 +234,9 @@ def build_graph(llm: BaseChatModel, store: Chroma) -> CompiledStateGraph:
     graph.add_node("retrieve", retrieve)
     graph.add_node("respond", respond)
     graph.add_edge(START, "parse_query")
-    graph.add_edge("parse_query", "retrieve")
+    graph.add_conditional_edges(
+        "parse_query", lambda state: END if state["is_chat"] else "retrieve"
+    )
     graph.add_edge("retrieve", "respond")
     graph.add_edge("respond", END)
     return graph.compile(checkpointer=InMemorySaver())
